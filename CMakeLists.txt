@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.10)
+project(NcursesHelloWorld LANGUAGES C)
+
+find_package(Curses REQUIRED)
+if(DEFINED ENV{MSYSTEM})
+    include_directories(${CURSES_INCLUDE_DIRS} $ENV{MINGW_PREFIX}/include/ncursesw)
+else()
+    include_directories(${CURSES_INCLUDE_DIRS})
+endif()
+
+add_executable(hello main.c)
+if(DEFINED ENV{MSYSTEM})
+    target_link_libraries(hello ${CURSES_LIBRARIES} ncursesw)
+else()
+    target_link_libraries(hello ${CURSES_LIBRARIES})
+endif()
