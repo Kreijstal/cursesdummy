@@ -1,9 +1,20 @@
 #include <ncurses.h>
 #include <string.h>
+#include <pthread.h>
 
-typedef void (*MenuCallback)(const char*);
+// Function prototypes
+typedef void (*StopFunction)();
+typedef StopFunction (*MenuCallback)(WINDOW*, const char*);
 
-void show_menu1(const char** options, int num_items, MenuCallback callback) {
+StopFunction menu_callback(WINDOW* content, const char* selected);
+StopFunction animated_callback(WINDOW* content, const char* selected);
+
+typedef struct {
+    const char* display_text;
+    MenuCallback callback;
+} MenuOption;
+
+const char* show_menu1(MenuOption* options, int num_items) {
     // Create selection menu
     WINDOW* menu = newwin(10, 30, 5, 5);
     box(menu, 0, 0);
@@ -14,7 +25,7 @@ void show_menu1(const char** options, int num_items, MenuCallback callback) {
     while(1) {
         for(int i = 0; i < num_items; i++) {
             if(i == choice) wattron(menu, A_REVERSE);
-            mvwprintw(menu, i+1, 2, "%s", options[i]);
+            mvwprintw(menu, i+1, 2, "%s", options[i].display_text);
             if(i == choice) wattroff(menu, A_REVERSE);
         }
         wrefresh(menu);
@@ -37,7 +48,7 @@ void show_menu1(const char** options, int num_items, MenuCallback callback) {
     }
 }
 
-void show_menu2(const char** options, int num_items, MenuCallback callback) {
+const char* show_menu2(MenuOption* options, int num_items) {
     // Save current cursor position
     int orig_y, orig_x;
     getyx(stdscr, orig_y, orig_x);
@@ -54,28 +65,31 @@ void show_menu2(const char** options, int num_items, MenuCallback callback) {
     }
     
     int choice = 0;
-    const char* option_contents[] = {
-        "Option 1 Details:\n- Feature A\n- Feature B\n- Value: 42",
-        "Option 2 Info:\n- Status: Active\n- Count: 17\n- Mode: Standard",
-        "Option 3 Data:\n- Temperature: 23C\n- Pressure: 1013hPa\n- Humidity: 45%",
-        "Exit the menu system"
-    };
+    // Draw vertical divider and menu border
+    for(int y = 0; y < max_y; y++) {
+        mvaddch(y, menu_width, ACS_VLINE);
+    }
+    refresh(); // Make sure divider is visible
+    WINDOW* content = newwin(max_y, max_x-menu_width-1, 0, menu_width+1);
+    StopFunction current_stop = NULL;
     
     while(1) {
         // Draw menu items
         for(int i = 0; i < num_items; i++) {
             if(i == choice) attron(A_REVERSE);
-            mvprintw(i, 1, "%s", options[i]);
+            mvprintw(i, 1, "%s", options[i].display_text);
             if(i == choice) attroff(A_REVERSE);
         }
         
-        // Draw content pane
-        WINDOW* content = newwin(max_y-2, max_x-menu_width-2, 1, menu_width+1);
+        // Call the callback for the current choice
+        if (current_stop) {
+            current_stop();
+            current_stop = NULL;
+        }
+        
         wclear(content);
-        box(content, 0, 0);
-        mvwprintw(content, 1, 1, "%s", option_contents[choice]);
+        current_stop = options[choice].callback(content, options[choice].display_text);
         wrefresh(content);
-        delwin(content);
         
         refresh();
         
@@ -88,38 +102,104 @@ void show_menu2(const char** options, int num_items, MenuCallback callback) {
                 choice = (choice < num_items-1) ? choice+1 : 0;
                 break;
             case 10: // Enter key
+                if (current_stop) {
+                    current_stop();
+                }
+                delwin(content);
                 move(orig_y, orig_x);
                 refresh();
-                callback(options[choice]);
-                return;
+                return options[choice].display_text;
         }
     }
 }
 
-void menu_callback(const char* selected) {
-    if(strcmp(selected, "Quit") != 0) {
-        printw("Selected: %s\n", selected);
-        refresh();
+StopFunction menu_callback(WINDOW* content, const char* selected) {
+    if(strcmp(selected, "Quit") == 0) {
+        return NULL;
     }
+    
+    // Clear and show prominent selection
+    wclear(content);
+    wattron(content, A_BOLD);
+    mvwprintw(content, 0, 0, ">> %s <<", selected);
+    wattroff(content, A_BOLD);
+    
+    // Add separator line
+    int max_x = getmaxx(content);
+    for(int x = 0; x < max_x; x++) {
+        mvwaddch(content, 1, x, ACS_HLINE);
+    }
+    
+    // Example content - can be replaced with actual implementation
+    mvwprintw(content, 3, 0, "Details will appear here");
+    wrefresh(content);
+    
+    // Return a simple stop function
+    return (StopFunction)NULL;
+}
+
+// Animation thread function
+void* animation_thread(void* arg) {
+    WINDOW* win = (WINDOW*)arg;
+    volatile int* keep_running = (volatile int*)arg;
+    int x = 0;
+    int dir = 1;
+    int width = getmaxx(win) - 10;
+    
+    while(*keep_running) {
+        wclear(win);
+        mvwprintw(win, 0, 0, ">> Animation <<");
+        mvwprintw(win, 2, x, "====>");
+        wrefresh(win);
+        
+        x += dir;
+        if(x >= width || x <= 0) dir *= -1;
+        
+        napms(100); // 100ms delay
+    }
+    return NULL;
+}
+
+StopFunction animated_callback(WINDOW* content, const char* selected) {
+    volatile int keep_running = 1;
+    
+    // Create animation thread with both window and keep_running flag
+    pthread_t thread;
+    struct {
+        WINDOW* win;
+        volatile int* running;
+    } thread_args = {content, &keep_running};
+    pthread_create(&thread, NULL, animation_thread, &thread_args);
+    
+    // Return stop function
+    void stop_animation() {
+        keep_running = 0;
+        pthread_join(thread, NULL);
+    }
+    
+    return stop_animation;
 }
 
 int main() {
-    // Initialize ncurses without clearing screen
+    // Initialize ncurses
     SCREEN* screen = newterm(NULL, stdout, stdin);
     set_term(screen);
-    
-    // Enable keypad and echo
     keypad(stdscr, TRUE);
     echo();
-    
-    // Enable scrolling
     scrollok(stdscr, TRUE);
     
-    // REPL loop
-    char input[256];
-    const char* menu_items[] = {"Option 1", "Option 2", "Option 3", "Quit"};
-    int num_menu_items = sizeof(menu_items)/sizeof(menu_items[0]);
+    // Setup menu system
+    MenuOption menu_items[] = {
+        {"Option 1", menu_callback},
+        {"Option 2", menu_callback},
+        {"Option 3", menu_callback},
+        {"Animation", animated_callback},
+        {"Quit", menu_callback}
+    };
+    int num_items = sizeof(menu_items)/sizeof(MenuOption);
     
+    // Main REPL loop
+    char input[256];
     while(1) {
         printw("> ");
         getstr(input);
@@ -132,14 +212,16 @@ int main() {
             printw("Choose menu style (1 or 2): ");
             getstr(input);
             if(strcmp(input, "2") == 0) {
-                show_menu2(menu_items, num_menu_items, menu_callback);
+                const char* choice = show_menu2(menu_items, num_items, menu_callback);
+                printw("Selected: %s\n", choice);
             } else {
-                show_menu1(menu_items, num_menu_items, menu_callback);
+                const char* choice = show_menu1(menu_items, num_items, menu_callback);
+                printw("Selected: %s\n", choice);
             }
         }
     }
     
-    // Clean up while preserving terminal state
+    // Cleanup
     reset_shell_mode();
     delscreen(screen);
     return 0;
