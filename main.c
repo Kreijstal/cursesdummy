@@ -1,13 +1,18 @@
 #include <ncurses.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 // Function prototypes
-typedef void (*StopFunction)();
-typedef StopFunction (*MenuCallback)(WINDOW*, const char*);
+typedef struct {
+    void (*stop)(void*);
+    void* context;
+} StopHandle;
 
-StopFunction menu_callback(WINDOW* content, const char* selected);
-StopFunction animated_callback(WINDOW* content, const char* selected);
+typedef StopHandle (*MenuCallback)(WINDOW*, const char*);
+
+StopHandle menu_callback(WINDOW* content, const char* selected);
+StopHandle animated_callback(WINDOW* content, const char* selected);
 
 typedef struct {
     const char* display_text;
@@ -42,8 +47,7 @@ const char* show_menu1(MenuOption* options, int num_items) {
                 werase(menu);
                 wrefresh(menu);
                 delwin(menu);
-                callback(options[choice]);
-                return;
+                return options[choice].display_text;
         }
     }
 }
@@ -70,8 +74,17 @@ const char* show_menu2(MenuOption* options, int num_items) {
         mvaddch(y, menu_width, ACS_VLINE);
     }
     refresh(); // Make sure divider is visible
-    WINDOW* content = newwin(max_y, max_x-menu_width-1, 0, menu_width+1);
-    StopFunction current_stop = NULL;
+    WINDOW* content = NULL;
+    StopHandle current_stop = {0};
+    
+    // Initialize content window
+    content = newwin(max_y, max_x-menu_width-1, 0, menu_width+1);
+    if (!content) {
+        move(orig_y, orig_x);
+        refresh();
+        return NULL;
+    }
+    keypad(content, TRUE);
     
     while(1) {
         // Draw menu items
@@ -80,16 +93,28 @@ const char* show_menu2(MenuOption* options, int num_items) {
             mvprintw(i, 1, "%s", options[i].display_text);
             if(i == choice) attroff(A_REVERSE);
         }
+        refresh();
         
         // Call the callback for the current choice
-        if (current_stop) {
-            current_stop();
-            current_stop = NULL;
+        if (current_stop.stop) {
+            fprintf(stderr, "DEBUG: Calling current stop function\n");
+            current_stop.stop(current_stop.context);
+            current_stop.stop = NULL;
+            if (current_stop.context) {
+                free(current_stop.context);
+                current_stop.context = NULL;
+            }
+            fprintf(stderr, "DEBUG: Stop function completed\n");
+            if (content) {
+                wclear(content);
+                wrefresh(content);
+            }
         }
         
-        wclear(content);
-        current_stop = options[choice].callback(content, options[choice].display_text);
-        wrefresh(content);
+        if (content) {
+            current_stop = options[choice].callback(content, options[choice].display_text);
+            wrefresh(content);
+        }
         
         refresh();
         
@@ -102,10 +127,25 @@ const char* show_menu2(MenuOption* options, int num_items) {
                 choice = (choice < num_items-1) ? choice+1 : 0;
                 break;
             case 10: // Enter key
-                if (current_stop) {
-                    current_stop();
+                fprintf(stderr, "DEBUG: Handling menu option change\n");
+                if (current_stop.stop) {
+                    fprintf(stderr, "DEBUG: Calling current_stop()\n");
+                    current_stop.stop(current_stop.context);
+                    current_stop.stop = NULL;
+                    if (current_stop.context) {
+                        free(current_stop.context);
+                        current_stop.context = NULL;
+                    }
+                    fprintf(stderr, "DEBUG: current_stop() completed\n");
                 }
-                delwin(content);
+                if (content) {
+                    fprintf(stderr, "DEBUG: Deleting content window\n");
+                    werase(content);
+                    wrefresh(content);
+                    delwin(content);
+                    content = NULL;
+                    fprintf(stderr, "DEBUG: Content window deleted\n");
+                }
                 move(orig_y, orig_x);
                 refresh();
                 return options[choice].display_text;
@@ -113,9 +153,9 @@ const char* show_menu2(MenuOption* options, int num_items) {
     }
 }
 
-StopFunction menu_callback(WINDOW* content, const char* selected) {
+StopHandle menu_callback(WINDOW* content, const char* selected) {
     if(strcmp(selected, "Quit") == 0) {
-        return NULL;
+        return (StopHandle){0};
     }
     
     // Clear and show prominent selection
@@ -134,19 +174,53 @@ StopFunction menu_callback(WINDOW* content, const char* selected) {
     mvwprintw(content, 3, 0, "Details will appear here");
     wrefresh(content);
     
-    // Return a simple stop function
-    return (StopFunction)NULL;
+    // Return empty stop handle
+    return (StopHandle){0};
 }
 
-// Animation thread function
+// Animation context structure
+typedef struct {
+    pthread_t thread;
+    WINDOW* win;
+    int* keep_running;
+    pthread_mutex_t lock;
+} AnimationContext;
+
 void* animation_thread(void* arg) {
-    WINDOW* win = (WINDOW*)arg;
-    volatile int* keep_running = (volatile int*)arg;
+    fprintf(stderr, "DEBUG: Starting animation thread\n");
+    if (!arg) {
+        fprintf(stderr, "ERROR: NULL arg in animation_thread\n");
+        return NULL;
+    }
+    
+    AnimationContext* ctx = (AnimationContext*)arg;
+    
+    pthread_mutex_lock(&ctx->lock);
+    if (!ctx->win || !ctx->keep_running) {
+        fprintf(stderr, "ERROR: Invalid animation context\n");
+        pthread_mutex_unlock(&ctx->lock);
+        return NULL;
+    }
+    
+    WINDOW* win = ctx->win;
+    volatile int* keep_running = ctx->keep_running;
+    pthread_mutex_unlock(&ctx->lock);
+    fprintf(stderr, "DEBUG: Animation thread initialized\n");
+
     int x = 0;
     int dir = 1;
     int width = getmaxx(win) - 10;
     
-    while(*keep_running) {
+    while(1) {
+        pthread_mutex_lock(&ctx->lock);
+        int should_run = (keep_running && *keep_running);
+        pthread_mutex_unlock(&ctx->lock);
+        
+        if (!should_run) {
+            fprintf(stderr, "DEBUG: Animation thread exiting\n");
+            break;
+        }
+        
         wclear(win);
         mvwprintw(win, 0, 0, ">> Animation <<");
         mvwprintw(win, 2, x, "====>");
@@ -157,27 +231,91 @@ void* animation_thread(void* arg) {
         
         napms(100); // 100ms delay
     }
+    
     return NULL;
 }
 
-StopFunction animated_callback(WINDOW* content, const char* selected) {
-    volatile int keep_running = 1;
-    
-    // Create animation thread with both window and keep_running flag
-    pthread_t thread;
-    struct {
-        WINDOW* win;
-        volatile int* running;
-    } thread_args = {content, &keep_running};
-    pthread_create(&thread, NULL, animation_thread, &thread_args);
-    
-    // Return stop function
-    void stop_animation() {
-        keep_running = 0;
-        pthread_join(thread, NULL);
+// Global stop function
+void stop_animation(void* context) {
+    fprintf(stderr, "DEBUG: Entering stop_animation()\n");
+    if (!context) {
+        fprintf(stderr, "DEBUG: NULL context in stop_animation\n");
+        return;
     }
     
-    return stop_animation;
+    AnimationContext* ctx = (AnimationContext*)context;
+    
+    // Lock before accessing shared resources
+    pthread_mutex_lock(&ctx->lock);
+    
+    // Signal thread to stop
+    if (ctx->keep_running) {
+        fprintf(stderr, "DEBUG: Setting keep_running to 0\n");
+        *(ctx->keep_running) = 0;
+    }
+    
+    // Unlock after modifying shared resources
+    pthread_mutex_unlock(&ctx->lock);
+    
+    // Wait for thread to finish
+    if (ctx->thread) {
+        fprintf(stderr, "DEBUG: Joining thread\n");
+        pthread_join(ctx->thread, NULL);
+        fprintf(stderr, "DEBUG: Thread joined\n");
+    }
+    
+    // Clean up resources
+    pthread_mutex_lock(&ctx->lock);
+    if (ctx->keep_running) {
+        fprintf(stderr, "DEBUG: Freeing keep_running\n");
+        free(ctx->keep_running);
+        ctx->keep_running = NULL;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    
+    pthread_mutex_destroy(&ctx->lock);
+    //free(ctx); //doublefree
+}
+
+StopHandle animated_callback(WINDOW* content, const char* selected) {
+    fprintf(stderr, "DEBUG: Entering animated_callback()\n");
+    if (!content) {
+        fprintf(stderr, "ERROR: NULL content window in animated_callback\n");
+        return (StopHandle){0};
+    }
+    
+    // Allocate and initialize context
+    AnimationContext* ctx = calloc(1, sizeof(AnimationContext));
+    if (!ctx) {
+        fprintf(stderr, "ERROR: Failed to allocate animation context\n");
+        return (StopHandle){0};
+    }
+
+    pthread_mutex_init(&ctx->lock, NULL);
+    ctx->keep_running = calloc(1, sizeof(int));
+    if (!ctx->keep_running) {
+        fprintf(stderr, "ERROR: Failed to allocate keep_running flag\n");
+        pthread_mutex_destroy(&ctx->lock);
+        //free(ctx); double free
+        return (StopHandle){0};
+    }
+    *(ctx->keep_running) = 1;
+
+    // Create animation thread
+    pthread_t thread;
+
+    // Pass context directly to thread
+    ctx->win = content;
+    if (pthread_create(&thread, NULL, animation_thread, ctx) != 0) {
+        fprintf(stderr, "ERROR: Failed to create animation thread\n");
+        free(ctx->keep_running);
+        free(ctx);
+        return (StopHandle){0};
+    }
+    
+    // Setup return handle
+    ctx->thread = thread;
+    return (StopHandle){ .stop = stop_animation, .context = ctx };
 }
 
 int main() {
@@ -212,10 +350,10 @@ int main() {
             printw("Choose menu style (1 or 2): ");
             getstr(input);
             if(strcmp(input, "2") == 0) {
-                const char* choice = show_menu2(menu_items, num_items, menu_callback);
+                const char* choice = show_menu2(menu_items, num_items);
                 printw("Selected: %s\n", choice);
             } else {
-                const char* choice = show_menu1(menu_items, num_items, menu_callback);
+                const char* choice = show_menu1(menu_items, num_items);
                 printw("Selected: %s\n", choice);
             }
         }
